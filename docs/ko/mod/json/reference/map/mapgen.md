@@ -200,6 +200,19 @@ apartments_mod_tower 오버맵 지형 ID와 각각 연결됩니다.
 
 기본값: 1000
 
+### mapgen "context_weights" 정의
+
+(선택) 생성 시점에 오버맵 지형 주변(이웃, z 레벨, 생성되는 지형 자체)에 따라 정적 "weight"를
+재정의하는 규칙 목록입니다. 규칙은 순서대로 평가되며, 조건이 모두 충족되는 첫 번째 규칙이 이번
+생성에 사용될 가중치를 제공합니다. 어느 것도 일치하지 않으면 정적 "weight"가 적용됩니다.
+조건 키 목록과 예제는
+[맵젠 가이드](../guides/map/mapgen.md#문맥-의존-가중치context_weights)를 참조하세요.
+
+값: 각각 필수 "weight"(number >= 0, _문맥에서 0이면 비활성화_)와 선택적 "if"(조건 객체)를 가진
+규칙 객체의 배열
+
+기본값: 규칙 없음 -- 정적 "weight"가 항상 적용됨
+
 ## `overmap_terrain` 변수가 mapgen에 주는 영향
 
 standalone에서는 `"id"`가 필수 `"om_terrain"` id를 결정합니다. 단, `overmap_terrain`에 다음

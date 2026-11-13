@@ -114,6 +114,60 @@ Sample:
    determine how often each spawns in relation to the other. Say the furnished house is at 100, and
    the abandoned one is at 20. So, it'll spawn 5x less than the furnished house.
 
+### Context-dependent weights (`"context_weights"`):
+
+The static `"weight"` above can be overridden at generation time based on where on the overmap the
+terrain is being generated. This is done with the optional `"context_weights"` member, which holds a
+list of override rules. The rules are evaluated in the order they are defined, and the **first rule
+whose conditions all hold** provides the weight used for this generation. If no rule matches, the
+static `"weight"` applies. A rule whose `"weight"` is 0 disables the mapgen in that context, which
+is useful to forbid, say, residential interiors in otherwise wild terrain.
+
+Conditions are given in the `"if"` object of a rule. All conditions within one rule must hold for
+the rule to match. The following condition keys are supported:
+
+| Key | Meaning |
+|---|---|
+| `"north"`, `"east"`, `"south"`, `"west"`, `"north_east"`, `"south_east"`, `"south_west"`, `"north_west"` | The neighboring overmap terrain in that direction. |
+| `"any_neighbor"` | At least one of the eight neighboring overmap terrains matches. |
+| `"all_neighbors"` | All eight neighboring overmap terrains match. |
+| `"above"`, `"below"` | The neighboring overmap terrain one z level above / below. |
+| `"z"` | The z level being generated: `"surface"` (z level 0), `"underground"` (below 0), `"above"` (above 0) or a specific z level number. |
+| `"terrain"` | The overmap terrain being generated itself. |
+
+A terrain condition value may be a single string, an array of strings (any of them matching counts),
+or an object `{"match": string_or_array, "match_type": "EXACT"|"TYPE"|"PREFIX"|"SUBTYPE"|"CONTAINS"}`.
+Matching uses the same rules as the `om_terrain_match_type` member elsewhere in the game's JSON;
+the default match type is `"TYPE"`, which matches rotations and linear variations of the terrain
+but, for example, does **not** match `"forest"` against the separate `"forest_thick"` terrain --
+use `"match_type": "PREFIX"` for that.
+
+Example: a cabin mapgen that generates much more often surrounded by forest, and never next to
+cities:
+
+```json
+{
+  "type": "mapgen",
+  "method": "json",
+  "om_terrain": "cabin",
+  "weight": 1000,
+  "context_weights": [
+    {
+      "weight": 0,
+      "if": { "any_neighbor": { "match": "bungalow", "match_type": "PREFIX" } }
+    },
+    {
+      "weight": 4000,
+      "if": { "any_neighbor": { "match": "forest", "match_type": "PREFIX" } }
+    }
+  ],
+  "object": { "..": "..." }
+}
+```
+
+When the "match" patterns do not match any loaded overmap terrain, the mapgen check reports them
+to the debug log (the build is not aborted).
+
 ### The object data:
 
 This is the section of tags that defines your map, its terrains, furniture, and various spawn types.

@@ -98,7 +98,20 @@ auto run_mapgen_update_func(
 auto run_mapgen_update_func(
     const std::string& update_mapgen_id, mapgendata& dat, bool cancel_on_collision = true) -> bool;
 auto run_mapgen_func(const std::string& mapgen_id, mapgendata& dat) -> bool;
-auto pick_mapgen_func(const std::string& mapgen_id) -> std::shared_ptr<mapgen_function>;
+/**
+ * Picks a mapgen for @p mapgen_id honoring the context-dependent weights of
+ * the overmap terrain generation described by @p dat, see
+ * @ref mapgen_context_weights.
+ */
+auto pick_mapgen_func(const std::string& mapgen_id, const mapgendata& dat)
+    -> std::shared_ptr<mapgen_function>;
+/**
+ * Picks a mapgen for @p mapgen_id based on the static JSON weights only.
+ * Only use where no @ref mapgendata context is available (e.g. deciding
+ * whether a lazy OMT job needs the main thread); prefer @ref pick_mapgen_func
+ * when a generation context exists.
+ */
+auto pick_static_mapgen_func(const std::string& mapgen_id) -> std::shared_ptr<mapgen_function>;
 auto mapgen_function_needs_main_thread(const std::shared_ptr<mapgen_function>& func) -> bool;
 auto mapgen_has_any_direct_lua_generator() -> bool;
 auto mapgen_id_has_direct_lua_generator(const std::string& mapgen_id) -> bool;

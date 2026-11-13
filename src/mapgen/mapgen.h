@@ -3,6 +3,7 @@
 #include "cata_variant.h"
 #include "coordinates.h"
 #include "json.h"
+#include "mapgen_context_weights.h"
 #include "mapgen_parameter.h"
 #include "memory_fast.h"
 #include "pimpl.h"
@@ -38,6 +39,23 @@ using building_gen_pointer = void (*)(mapgendata&);
 class mapgen_function {
 public:
     int weight;
+
+    /**
+     * The weight of this mapgen function for a specific overmap terrain
+     * generation, evaluated from the context-dependent rules @ref
+     * context_weights against @p dat.  @see mapgen_context_weights
+     */
+    auto weight_for(const mapgendata& dat) const -> int {
+        return context_weights.empty() ? weight : context_weights.get_weight(dat, weight);
+    }
+
+    /**
+     * Context-dependent weight rules parsed from the "context_weights" JSON
+     * member, empty for mapgen kinds that do not support them.  Kept on the
+     * base class so all mapgen kinds (JSON, built-in, Lua) can be weighted by
+     * the same generation context.  @see mapgen_context_weights
+     */
+    mapgen_context_weights context_weights;
 
 protected:
     mapgen_function(const int w): weight(w) {}

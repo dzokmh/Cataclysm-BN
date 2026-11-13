@@ -201,6 +201,20 @@ Values: number - _0 disables_
 
 Default: 1000
 
+### Define mapgen "context_weights"
+
+(optional) A list of rules that override the static "weight" based on the overmap terrain
+surroundings at generation time: neighbors, z level, and the generated terrain itself. Rules are
+evaluated in order and the first one whose conditions all hold provides the weight used for this
+generation; if none matches, the static "weight" applies. See the
+[mapgen guide](../guides/map/mapgen.md#context-dependent-weights-context_weights) for the list of
+condition keys and examples.
+
+Values: array of rule objects with mandatory "weight" (number >= 0, _0 disables in that context_)
+and optional "if" (object of conditions)
+
+Default: no rules -- static "weight" always applies
+
 ## How "overmap_terrain" variables affect mapgen
 
 "id" is used to determine the required "om_terrain" id for standalone, _except_ when the following

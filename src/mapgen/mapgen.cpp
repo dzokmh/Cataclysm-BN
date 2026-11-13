@@ -141,29 +141,6 @@ auto mapgen_constructor::generate(
         terrain_type = omap.ter(omt_pos);
     }
 
-    auto draw_options = options;
-    const auto function_key = terrain_type->get_mapgen_id();
-    if (draw_options.use_selected_mapgen) {
-        if (draw_options.worker_safe
-            && mapgen_function_needs_main_thread(draw_options.selected_mapgen)) {
-            return {
-                .status = mapgen_result_status::needs_main_thread,
-                .selected_mapgen = draw_options.selected_mapgen,
-            };
-        }
-    } else if (draw_options.worker_safe) {
-        draw_options.selected_mapgen = pick_mapgen_func(function_key);
-        if (mapgen_function_needs_main_thread(draw_options.selected_mapgen)) {
-            return {
-                .status = mapgen_result_status::needs_main_thread,
-                .selected_mapgen = draw_options.selected_mapgen,
-            };
-        }
-        draw_options.use_selected_mapgen = true;
-    }
-
-    if (!ensure_omt_submaps(when)) { return {}; }
-
     // This attempts to scale density of zombies inversely with distance from the nearest city.
     // In other words, make city centers dense and perimeters sparse.
     auto density = 0.0f;
@@ -177,7 +154,34 @@ auto mapgen_constructor::generate(
         density = density / 100;
     }
 
+    // The mapgendata is built before the mapgen function is picked so that
+    // context-dependent mapgen selection (see mapgen_function::weight_for)
+    // can inspect it.
     mapgendata dat(omt_pos, *this, density, when, nullptr, omap);
+
+    auto draw_options = options;
+    const auto function_key = terrain_type->get_mapgen_id();
+    if (draw_options.use_selected_mapgen) {
+        if (draw_options.worker_safe
+            && mapgen_function_needs_main_thread(draw_options.selected_mapgen)) {
+            return {
+                .status = mapgen_result_status::needs_main_thread,
+                .selected_mapgen = draw_options.selected_mapgen,
+            };
+        }
+    } else if (draw_options.worker_safe) {
+        draw_options.selected_mapgen = pick_mapgen_func(function_key, dat);
+        if (mapgen_function_needs_main_thread(draw_options.selected_mapgen)) {
+            return {
+                .status = mapgen_result_status::needs_main_thread,
+                .selected_mapgen = draw_options.selected_mapgen,
+            };
+        }
+        draw_options.use_selected_mapgen = true;
+    }
+
+    if (!ensure_omt_submaps(when)) { return {}; }
+
     {
         ZoneScopedN("generate_draw_map");
         const auto draw_result = draw_map(dat, draw_options);
@@ -290,7 +294,7 @@ public:
      */
     auto generate(mapgendata& dat, const int hardcoded_weight) const -> bool {
         ZoneScopedN("mapgen_container_generate");
-        const auto ptr = pick(hardcoded_weight);
+        const auto ptr = pick(dat, hardcoded_weight);
         if (!ptr) { return false; }
         {
             ZoneScopedN("mapgen_container_dispatch");
@@ -298,16 +302,47 @@ public:
         }
         return true;
     }
-    auto pick(const int hardcoded_weight) const -> std::shared_ptr<mapgen_function> {
+    /**
+     * Pick a mapgen function randomly, with the weights adjusted to the
+     * context of the overmap terrain generation described by @p dat, see
+     * @ref mapgen_function::weight_for.
+     * @p hardcoded_weight Weight for an additional entry. If that entry is chosen,
+     * null is returned. If unsure, just use 0 for it.
+     */
+    auto pick(const mapgendata& dat, const int hardcoded_weight) const
+        -> std::shared_ptr<mapgen_function> {
+        ZoneScopedN("mapgen_container_pick");
+        weighted_int_list<std::shared_ptr<mapgen_function>> effective_weights;
+        for (const weighted_object<int, std::shared_ptr<mapgen_function>>& entry : weights_) {
+            const int weight = entry.obj->weight_for(dat);
+            if (weight < 1) {
+                continue; // rejected!
+            }
+            effective_weights.add(entry.obj, weight);
+        }
+        if (hardcoded_weight > 0
+            && rng(1, effective_weights.get_weight() + hardcoded_weight)
+                   > effective_weights.get_weight()) {
+            return nullptr;
+        }
+        const std::shared_ptr<mapgen_function>* ptr = effective_weights.pick();
+        if (!ptr) { return nullptr; }
+        assert(*ptr);
+        return *ptr;
+    }
+    /**
+     * Pick a mapgen function randomly based on the static weights defined in
+     * its JSON, without any generation context.  Only use this where no
+     * @ref mapgendata is available, prefer @ref pick with a context so that
+     * context-dependent weights (see @ref mapgen_function::weight_for) apply.
+     */
+    auto pick_static(const int hardcoded_weight) const -> std::shared_ptr<mapgen_function> {
+        ZoneScopedN("mapgen_container_pick_static");
         if (hardcoded_weight > 0
             && rng(1, weights_.get_weight() + hardcoded_weight) > weights_.get_weight()) {
             return nullptr;
         }
-        const std::shared_ptr<mapgen_function>* ptr = nullptr;
-        {
-            ZoneScopedN("mapgen_container_pick");
-            ptr = weights_.pick();
-        }
+        const std::shared_ptr<mapgen_function>* ptr = weights_.pick();
         if (!ptr) { return nullptr; }
         assert(*ptr);
         return *ptr;
@@ -433,11 +468,20 @@ public:
         if (iter == mapgens_.end()) { return false; }
         return iter->second.generate(dat, hardcoded_weight);
     }
-    auto pick(const std::string& key, const int hardcoded_weight = 0) const
+    /// @see mapgen_basic_container::pick.  Weights are adjusted to @p dat.
+    auto pick(const mapgendata& dat, const std::string& key, const int hardcoded_weight = 0) const
         -> std::shared_ptr<mapgen_function> {
         const auto iter = mapgens_.find(disable_mapgen ? "test" : key);
         if (iter == mapgens_.end()) { return nullptr; }
-        return iter->second.pick(hardcoded_weight);
+        return iter->second.pick(dat, hardcoded_weight);
+    }
+    /// Picks by the static JSON weights without any generation context,
+    /// @see mapgen_basic_container::pick_static.
+    auto pick_static(const std::string& key, const int hardcoded_weight = 0) const
+        -> std::shared_ptr<mapgen_function> {
+        const auto iter = mapgens_.find(disable_mapgen ? "test" : key);
+        if (iter == mapgens_.end()) { return nullptr; }
+        return iter->second.pick_static(hardcoded_weight);
     }
     auto has_direct_lua_generator(const std::string& key) const -> bool {
         const auto iter = mapgens_.find(disable_mapgen ? "test" : key);
@@ -579,7 +623,11 @@ auto load_mapgen_function(
     const std::string mgtype = jio.get_string("method");
     if (mgtype == "builtin") {
         if (const building_gen_pointer ptr = get_mapgen_cfunction(jio.get_string("name"))) {
-            return std::make_shared<mapgen_function_builtin>(ptr, mgweight);
+            auto func = std::make_shared<mapgen_function_builtin>(ptr, mgweight);
+            if (jio.has_member("context_weights")) {
+                func->context_weights.load(jio.get_member("context_weights"));
+            }
+            return func;
         } else {
             jio.throw_error("function does not exist", "name");
         }
@@ -590,13 +638,21 @@ auto load_mapgen_function(
         JsonObject jo = jio.get_object("object");
         const json_source_location jsrc = jo.get_source_location();
         jo.allow_omitted_members();
-        return std::make_shared<mapgen_function_json>(jsrc, mgweight, offset, total);
+        auto func = std::make_shared<mapgen_function_json>(jsrc, mgweight, offset, total);
+        if (jio.has_member("context_weights")) {
+            func->context_weights.load(jio.get_member("context_weights"));
+        }
+        return func;
     } else if (mgtype == "lua") {
         if (!jio.has_string("luamethod")) {
             jio.throw_error(R"(mapgen with method "lua" must define string "luamethod")");
         }
         std::string luamethod = jio.get_string("luamethod");
-        return std::make_shared<mapgen_function_lua>(luamethod, mgweight);
+        auto func = std::make_shared<mapgen_function_lua>(luamethod, mgweight);
+        if (jio.has_member("context_weights")) {
+            func->context_weights.load(jio.get_member("context_weights"));
+        }
+        return func;
     } else {
         jio.throw_error(R"(invalid value: must be "builtin" or "json")", "method");
     }
@@ -3582,7 +3638,10 @@ auto mapgen_function_json_base::setup_common(const JsonObject& jo) -> bool {
     return true;
 }
 
-void mapgen_function_json::check(const std::string& oter_name) const { check_common(oter_name); }
+void mapgen_function_json::check(const std::string& oter_name) const {
+    check_common(oter_name);
+    context_weights.check(oter_name);
+}
 
 void mapgen_function_json_nested::check(const std::string& oter_name) const {
     check_common(oter_name);
@@ -3998,7 +4057,7 @@ auto mapgen_constructor::draw_map(mapgendata& dat, const mapgen_generate_options
                 generated = true;
             }
         } else if (options.worker_safe) {
-            const auto selected_mapgen = oter_mapgen.pick(function_key);
+            const auto selected_mapgen = oter_mapgen.pick(dat, function_key);
             if (selected_mapgen) {
                 if (mapgen_function_needs_main_thread(selected_mapgen)) {
                     return {
@@ -6208,9 +6267,16 @@ auto run_mapgen_func(const std::string& mapgen_id, mapgendata& dat) -> bool {
     return oter_mapgen.generate(dat, mapgen_id);
 }
 
-auto pick_mapgen_func(const std::string& mapgen_id) -> std::shared_ptr<mapgen_function> {
+auto pick_mapgen_func(const std::string& mapgen_id, const mapgendata& dat)
+    -> std::shared_ptr<mapgen_function> {
     ZoneScopedN("pick_mapgen_func");
-    return oter_mapgen.pick(mapgen_id);
+    // Weighted by the context of @p dat, see mapgen_context_weights.
+    return oter_mapgen.pick(dat, mapgen_id);
+}
+
+auto pick_static_mapgen_func(const std::string& mapgen_id) -> std::shared_ptr<mapgen_function> {
+    ZoneScopedN("pick_static_mapgen_func");
+    return oter_mapgen.pick_static(mapgen_id);
 }
 
 auto mapgen_function_needs_main_thread(const std::shared_ptr<mapgen_function>& func) -> bool {
