@@ -43,6 +43,7 @@ class npc;
 class overmap_connection;
 class overmap_special;
 class overmap_special_batch;
+struct geo_city;
 struct regional_settings;
 struct specials_overlay;
 template <typename E> struct enum_traits;
@@ -64,6 +65,18 @@ struct city {
     operator bool() const { return size >= 0; }
 
     auto get_distance_from(const tripoint_om_omt& p) const -> int;
+};
+
+/// Parameters for seeding one city with @ref overmap::spawn_city_with_finale.
+struct city_spawn_options {
+    /// City center in overmap terrain coordinates.
+    tripoint_om_omt pos;
+    /// City radius in OMT cells (vanilla rolls are around CITY_SIZE).
+    int size = 1;
+    /// Finale counter roll upper bound (vanilla: 5 for large, 15 for huge).
+    int finale_distance = 1;
+    /// Finale placement attempt budget (vanilla: 1500).
+    int finale_max_tries = 1500;
 };
 
 struct om_note {
@@ -513,6 +526,8 @@ private:
 
     // Overall terrain
     void place_river(point_om_omt pa, point_om_omt pb);
+    /// Paints base terrain from real-earth geo packets; returns true when painted.
+    auto place_geo() -> bool;
     void place_forests();
     void place_lakes();
     auto place_lake_columns() -> void;
@@ -524,6 +539,9 @@ private:
 
     void place_roads(
         const overmap* north, const overmap* east, const overmap* south, const overmap* west);
+    /// Registers local_road exits on real-earth road border cells so
+    /// procedural neighbors continue them past the packet coverage.
+    void place_geo_road_exits();
 
     void populate_connections_out_from_neighbors(
         const overmap* north, const overmap* east, const overmap* south, const overmap* west);
@@ -534,6 +552,27 @@ private:
 
     void place_cities();
     auto place_isolated_cities() -> void;
+    /// True when geo packets own city placement for this overmap:
+    /// real-earth mode with at least one city-listing packet covering it.
+    auto geo_city_guidance() -> bool;
+    /// True when geo packets paint this overmap's base terrain:
+    /// real-earth mode with any packet covering it.
+    auto geo_terrain_guidance() -> bool;
+    /// Places cities from real-earth geo packet city lists.  Returns true
+    /// when geo packets own city placement for this overmap, so the
+    /// procedural seeding in @ref place_cities is skipped.
+    auto place_geo_cities() -> bool;
+    /// Seeds one geo-packet city near its recorded position, nudging to
+    /// the nearest plausible seed terrain when the recorded center is
+    /// unusable (water).
+    auto place_geo_city(
+        const geo_city& city_def, const tripoint_om_omt& pos, int& placement_attempts) -> void;
+    /// Seeds one city at pos when the terrain allows: paints the street
+    /// intersection hub, builds streets and sewers, and retries around
+    /// the pre-modification layer state until the finale preference is
+    /// satisfied.  Returns true when the city was seeded into @p town.
+    auto spawn_city_with_finale(const city_spawn_options& opts, city& town, int& placement_attempts)
+        -> bool;
     auto place_building(
         const tripoint_om_omt& p, om_direction::type dir, city& town, bool attempt_finale_place)
         -> bool;

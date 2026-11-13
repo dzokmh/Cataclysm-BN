@@ -464,7 +464,9 @@ auto submap_load_manager::start_lazy_omt_job(const omt_key& key) -> lazy_omt_sta
         const auto terrain_type = get_overmapbuffer(key.first).ter(key.second);
         const auto mapgen_id = terrain_type->get_mapgen_id();
         if (mapgen_id_has_direct_lua_generator(mapgen_id)) {
-            const auto selected_mapgen = pick_mapgen_func(mapgen_id);
+            // Only used to detect a main-thread-needing generator here, no
+            // mapgendata exists yet, so the static JSON weights are used.
+            const auto selected_mapgen = pick_static_mapgen_func(mapgen_id);
             if (mapgen_function_needs_main_thread(selected_mapgen)) {
                 auto result = load_lazy_omt_zlevel_data(
                     mb, key.second,

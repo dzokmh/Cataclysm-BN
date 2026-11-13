@@ -75,6 +75,7 @@
 #include "overmap/omdata.h"
 #include "overmap/overmap.h"
 #include "overmap/overmap_connection.h"
+#include "overmap/overmap_geo.h"
 #include "overmap/overmap_location.h"
 #include "overmap/overmap_special.h"
 #include "overmap/overmapbuffer.h"
@@ -435,6 +436,7 @@ void DynamicDataLoader::initialize()
     add( "overmap_connection", &overmap_connections::load );
     add( "overmap_location", &overmap_locations::load );
     add( "overmap_special", &overmap_specials::load );
+    add( "overmap_geo", &overmap_geo::load );
     add( "city_building", &city_buildings::load );
     add( "map_extra", &MapExtras::load );
     add( "map_feature_description", &map_feature_descriptions::load_map_feature_descriptions );
@@ -652,6 +654,7 @@ void DynamicDataLoader::unload_data()
     overmap_land_use_codes::reset();
     overmap_locations::reset();
     overmap_specials::reset();
+    overmap_geo::reset();
     overmap_terrains::reset();
     overmap::reset_oter_id_migrations();
     profession::reset();
@@ -857,6 +860,7 @@ void DynamicDataLoader::check_consistency( loading_ui &ui )
             { _( "Overmap terrain" ), &overmap_terrains::check_consistency },
             { _( "Overmap locations" ), &overmap_locations::check_consistency },
             { _( "Overmap specials" ), &overmap_specials::check_consistency },
+            { _( "Overmap geo packets" ), &overmap_geo::check_consistency },
             { _( "Map extras" ), &MapExtras::check_consistency },
             { _( "Start locations" ), &start_locations::check_consistency },
             { _( "Regional settings" ), &check_regional_settings },

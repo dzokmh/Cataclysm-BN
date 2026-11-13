@@ -3071,6 +3071,13 @@ void options_manager::add_options_world_default()
     { { "default", "default" } }, "default"
        );
 
+    add( "GEOGRAPHY_MODE", world_default, translate_marker( "Geography mode" ),
+         translate_marker( "( WIP ) Overmap geography system. \"procedural\" uses the classic "
+                           "noise pipeline; \"real_earth\" paints base terrain from real-earth geo packets "
+                           "(falling back to noise outside coverage)." ),
+    { { "procedural", "procedural" }, { "real_earth", "real_earth" } }, "procedural"
+       );
+
     add_empty_line();
 
     add( "INITIAL_DAY", world_default, translate_marker( "Initial day" ),

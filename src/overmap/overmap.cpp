@@ -39,6 +39,7 @@
 #include "options.h"
 #include "output.h"
 #include "overmap_connection.h"
+#include "overmap_geo.h"
 #include "overmap_label.h"
 #include "overmap_location.h"
 #include "overmap_noise.h"
@@ -77,6 +78,7 @@
 #include <ranges>
 #include <set>
 #include <tuple>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 #include <vehicle/vehicle.h>
@@ -3171,8 +3173,14 @@ void overmap::generate(
     connection_cache = overmap_connection_cache{};
     populate_connections_out_from_neighbors(north, east, south, west);
 
-    place_rivers(north, east, south, west);
-    if (settings->overmap_lake.noise_threshold_lake > 0.0) { place_lakes(); }
+    if (get_option<std::string>("GEOGRAPHY_MODE") == "real_earth" && place_geo()) {
+        // Real-earth geo packets painted this overmap: procedural river/lake
+        // noise is skipped.  Forest noise below still adds micro texture on
+        // cells that zones left at the default terrain.
+    } else {
+        place_rivers(north, east, south, west);
+        if (settings->overmap_lake.noise_threshold_lake > 0.0) { place_lakes(); }
+    }
     if (settings->overmap_forest.noise_threshold_forest > 0.0) {
         place_forests();
         place_swamps();
@@ -3883,6 +3891,422 @@ void overmap::place_forest_trailheads() {
     }
 }
 
+namespace {
+/// Squared distance from @p p to segment @p a-@p b, in point units.
+auto distance_to_segment_sq(const point& a, const point& b, const point& p) -> double {
+    const auto ab = point(b.x - a.x, b.y - a.y);
+    const auto len_sq = static_cast<double>(ab.x) * ab.x + static_cast<double>(ab.y) * ab.y;
+    if (len_sq == 0.0) {
+        const auto dx = p.x - a.x;
+        const auto dy = p.y - a.y;
+        return static_cast<double>(dx) * dx + static_cast<double>(dy) * dy;
+    }
+    const auto ap_x = static_cast<double>(p.x - a.x);
+    const auto ap_y = static_cast<double>(p.y - a.y);
+    const auto ab_x = static_cast<double>(ab.x);
+    const auto ab_y = static_cast<double>(ab.y);
+    const auto t = std::clamp((ap_x * ab_x + ap_y * ab_y) / len_sq, 0.0, 1.0);
+    const auto dx = ap_x - ab_x * t;
+    const auto dy = ap_y - ab_y * t;
+    return dx * dx + dy * dy;
+}
+} // namespace
+
+/// Paints base overmap terrain of this overmap from geo packets.
+/// Rivers and lake noise passes are skipped by the caller when this paints.
+auto overmap::place_geo() -> bool {
+    namespace ranges = std::ranges;
+
+    const point_abs_omt base = global_base_point();
+    const point_abs_omt omap_max = base + point(OMAPX - 1, OMAPY - 1);
+
+    // React only where a packet actually intersects this overmap.
+    const bool covered = ranges::any_of(overmap_geo::all(), [&](const overmap_geo& packet) {
+        const geo_bounds b = packet.bounds();
+        return b.min.x() <= omap_max.x() && b.min.y() <= omap_max.y() && b.max.x() >= base.x()
+            && b.max.y() >= base.y();
+    });
+    if (!covered) { return false; }
+
+    // Paint zone classes: first covering packet wins per cell.  Toward a
+    // packet's coverage edge the painted terrain dissolves into the default
+    // procedural terrain with a noise-driven fringe, so the real-earth map
+    // blends into the surrounding procedural overmap instead of ending in a
+    // hard wall.  The fringe uses the same deterministic forest noise later
+    // consumed by place_forests(), so unconverted fringe cells get the exact
+    // forest/field mix the procedural pipeline would paint there anyway.
+    const om_noise::om_noise_layer_forest fringe_noise(global_base_point(), g->get_seed());
+    /// Fringe width in OMT cells; painted cells this close to the coverage
+    /// edge start yielding to procedural terrain.
+    constexpr int edge_fringe_cells = 12;
+    for (int x = 0; x < OMAPX; x++) {
+        for (int y = 0; y < OMAPY; y++) {
+            const point_abs_omt p = base + point(x, y);
+            for (const overmap_geo& packet : overmap_geo::all()) {
+                const auto zone = packet.zone_at(p);
+                if (!zone) { continue; }
+                if (const geo_zone_rule* rule = packet.rule_for(*zone); rule && rule->painted()) {
+                    const geo_bounds b = packet.bounds();
+                    const int edge = std::min(
+                        {p.x() - b.min.x(), b.max.x() - p.x(), p.y() - b.min.y(),
+                         b.max.y() - p.y()});
+                    if (edge < edge_fringe_cells
+                        && fringe_noise.noise_at(point_om_omt(x, y))
+                               > static_cast<float>(edge) / edge_fringe_cells) {
+                        break;
+                    }
+                    ter_set(tripoint_om_omt(x, y, 0), oter_id(*rule->paint));
+                }
+                break;
+            }
+        }
+    }
+
+    // Paint real-world city footprints of large cities, inside which OSM
+    // tertiary connectors would fight the procedural street pass.
+    struct city_footprint {
+        point_abs_omt pos;
+        int radius;
+    };
+    std::vector<city_footprint> big_city_footprints;
+    for (const overmap_geo& packet : overmap_geo::all()) {
+        for (const geo_city& city : packet.cities()) {
+            if (city.size >= 8) {
+                big_city_footprints.push_back(city_footprint{.pos = city.pos, .radius = city.size});
+            }
+        }
+    }
+    const auto inside_big_city = [&](const point_abs_omt& p) {
+        return ranges::any_of(big_city_footprints, [&](const city_footprint& c) {
+            const auto rel_x = p.x() - c.pos.x();
+            const auto rel_y = p.y() - c.pos.y();
+            return std::abs(rel_x) <= c.radius && std::abs(rel_y) <= c.radius;
+        });
+    };
+
+    // Paint river polylines; each river may carry its own width harvested
+    // from the source data, falling back to the packet's river rule width.
+    for (const overmap_geo& packet : overmap_geo::all()) {
+        const geo_river_rule* rule = packet.river_rule();
+        if (!rule) { continue; }
+        const oter_id river_paint(rule->paint);
+        for (const geo_river& river : packet.rivers()) {
+            const int width = river.width > 0 ? river.width : rule->width;
+            const double threshold = (width - 1) * 0.5 + 0.5;
+            const double threshold_sq = threshold * threshold;
+            const std::vector<point_abs_omt>& line = river.points;
+            for (std::size_t i = 0; i + 1 < line.size(); i++) {
+                const point a = (line[i] - base).raw();
+                const point b = (line[i + 1] - base).raw();
+                const auto min_x = std::min(a.x, b.x) - static_cast<int>(threshold);
+                const auto max_x = std::max(a.x, b.x) + static_cast<int>(threshold);
+                const auto min_y = std::min(a.y, b.y) - static_cast<int>(threshold);
+                const auto max_y = std::max(a.y, b.y) + static_cast<int>(threshold);
+                for (int x = std::max(min_x, 0); x <= std::min(max_x, OMAPX - 1); x++) {
+                    for (int y = std::max(min_y, 0); y <= std::min(max_y, OMAPY - 1); y++) {
+                        if (distance_to_segment_sq(a, b, point(x, y)) <= threshold_sq) {
+                            ter_set(tripoint_om_omt(x, y, 0), river_paint);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Paint real-world road polylines.  Two passes: first classify every
+    // road cell (plain line-drawing road terrain, or a bridge span running
+    // over water), then paint road line variants from the 4-neighborhood
+    // connectivity bitmask so turns, tees and junctions render correctly.
+    const oter_type_str_id road_type("road");
+    const oter_type_str_id bridge_type("bridge");
+    // Per-cell classification across both passes.
+    std::vector<std::uint8_t> is_road(OMAPX * OMAPY, 0);
+    std::vector<std::uint8_t> is_bridge(OMAPX * OMAPY, 0);
+    // Bridge span direction per bridge cell: the step direction that entered
+    // the cell while walking the road polyline.
+    std::vector<om_direction::type> bridge_dir(OMAPX * OMAPY, om_direction::type::invalid);
+    // Rasterizes one real road polyline, claiming cells in the classification
+    // masks with a 4-connected proportional staircase walk.  OSM roads are
+    // rarely axis-aligned; the lerp walk used diagonals that neither the line
+    // bitmask nor the bridge logic can represent, so every diagonal run fell
+    // apart into isolated pieces.  State lives at crossing level: water cells
+    // are deferred across segment and way boundaries, so a river crossing
+    // spread over several short ways becomes one continuous deck that follows
+    // the walked path, its ends anchored in land, instead of a chain of
+    // bridgeheads.  Motorway-tier roads (dual carriageways) also claim an
+    // orthogonal neighbor cell per step, forming a parallel lane band.
+    // Swamps are walkable wetlands, but an OSM road crossing one is a real
+    // elevated causeway, so the road claims treat them like water and the
+    // crossing gets actual bridge spans instead of road dashes on the water.
+    const oter_str_id swamp_oter("forest_water");
+    const auto watery = [&](const oter_id& t) -> bool { // *NOPAD*
+        return is_river_or_lake(t) || t == swamp_oter;
+    };
+    // Out of bounds counts as land so water runs stay inside the map.
+    const auto watery_at = [&](const point& p) -> bool { // *NOPAD*
+        if (p.x < 0 || p.x >= OMAPX || p.y < 0 || p.y >= OMAPY) { return false; }
+        return watery(ter(tripoint_om_omt(p.x, p.y, 0)));
+    };
+    const auto claim_cell = [&](int x, int y, om_direction::type dir, geo_road_tier tier) {
+        if (x < 0 || x >= OMAPX || y < 0 || y >= OMAPY) { return; }
+        // Tertiary connectors inside big city footprints are dropped:
+        // procedural streets own those areas.
+        if (tier >= geo_road_tier::local && inside_big_city(base + point(x, y))) { return; }
+        const std::size_t idx = y * OMAPX + x;
+        if (is_road[idx] || is_bridge[idx]) {
+            // Another road already claimed this cell (junction).
+            return;
+        }
+        if (watery(ter(tripoint_om_omt(x, y, 0)))) {
+            is_bridge[idx] = 1;
+        } else {
+            is_road[idx] = 1;
+        }
+        if (is_bridge[idx]) { bridge_dir[idx] = dir; }
+    };
+    // Deferred-walk state shared by every way of one crossing: OSM splits
+    // real causeways into several short ways whose shared junctions sit in
+    // open water, so per-way state would drop or double-head every way seam.
+    struct geo_walk_state {
+        /// One deferred water cell plus the step direction that reached it.
+        struct run_step {
+            point pos;
+            om_direction::type dir;
+        };
+        /// The water cells of the walked path, in walk order.  Consecutive
+        /// entries are always 4-adjacent — walk steps, way seam junctions and
+        /// run carries (keyed by walked cells) all chain into one path — so
+        /// claiming them as the bridge deck preserves the path's bends across
+        /// overmap seams instead of collapsing them into an L-chord.
+        std::vector<run_step> run;
+        std::optional<point> run_entry;
+    };
+    const auto rasterize_road = [&](const geo_road& road, geo_walk_state& st) {
+        const geo_road_tier tier = road.tier;
+        const bool dual_lane = tier == geo_road_tier::highway;
+        // Orthogonal lane offsets: south of horizontal steps, east of
+        // vertical ones, always adjacent (4-connected band).
+        const auto maybe_claim_lane = [&](const point& p, om_direction::type dir) {
+            if (dir == om_direction::type::east || dir == om_direction::type::west) {
+                claim_cell(p.x, p.y + 1, dir, tier);
+            } else {
+                claim_cell(p.x + 1, p.y, dir, tier);
+            }
+        };
+        // Out of bounds counts as land so water runs stay inside the map.
+        const auto& is_water = watery_at;
+        // Staircase walk state lives at crossing level (shared across the
+        // ways of one causeway, see geo_walk_state): land cells claim as the
+        // walk progresses, water cells defer to a run that keeps growing
+        // across way boundaries, so a crossing spread over several short
+        // ways becomes one continuous deck instead of a chain of
+        // bridgeheads.
+        // The deck is only drawn when both ends lead to land.  At the end
+        // of a way the deferred run of a rejected deck stays in the state so
+        // the next way continuing this crossing can pick it up (see the way
+        // chaining driver below), while mid-way drops leave nowhere to
+        // continue and are cleared.  A way truncated inside water (packet
+        // edge cut) ends without a land exit and no way behind it, so its
+        // deferred run ends up unused: stroking it anyway would leave a deck
+        // hanging in water with a bridgehead the ramp mapgen fills over
+        // open water.
+        const auto flush_run =
+            [&](const std::optional<point>& exit_override, const point& fallback_entry) -> bool {
+            if (st.run.empty()) { return false; }
+            const point entry = st.run_entry.value_or(fallback_entry);
+            const point exit = exit_override.value_or(st.run.back().pos);
+            if (is_water(entry) || is_water(exit)) { return false; }
+            // Claim the walked water path itself as the deck.  Run cells are
+            // a 4-connected path (consecutive walk steps are adjacent, way
+            // seam junctions and carried runs chain into the same path), so
+            // bends are preserved exactly and the deck meets the neighbour
+            // overmap's deck at the shared seam cell instead of at the
+            // nearest in-bounds approximation.
+            for (const auto& step : st.run) {
+                claim_cell(step.pos.x, step.pos.y, step.dir, tier);
+                if (dual_lane) { maybe_claim_lane(step.pos, step.dir); }
+            }
+            st.run.clear();
+            return true;
+        };
+        for (std::size_t seg_i = 0; seg_i + 1 < road.points.size(); seg_i++) {
+            const point a = (road.points[seg_i] - base).raw();
+            const point b = (road.points[seg_i + 1] - base).raw();
+            const int adx = std::abs(b.x - a.x);
+            const int ady = std::abs(b.y - a.y);
+            if (adx + ady == 0) { continue; }
+            // Verify the segment is even near this overmap before walking.
+            if (std::max(a.x, b.x) < -1 || std::min(a.x, b.x) > OMAPX || std::max(a.y, b.y) < -1
+                || std::min(a.y, b.y) > OMAPY) {
+                continue;
+            }
+            const int sx = b.x >= a.x ? 1 : -1;
+            const int sy = b.y >= a.y ? 1 : -1;
+            int x = a.x;
+            int y = a.y;
+            // Per-step proportional progress along each axis, for the staircase.
+            const double dx_step = static_cast<double>(adx) / (adx + ady);
+            const double dy_step = static_cast<double>(ady) / (adx + ady);
+            for (int step_i = 0; step_i <= adx + ady; step_i++) {
+                // Step along the axis whose proportional progress lags behind.
+                om_direction::type step_dir = om_direction::type::east;
+                if (x != b.x
+                    && (y == b.y
+                        || (dx_step * (step_i + 1) - std::abs(x - a.x))
+                               >= (dy_step * (step_i + 1) - std::abs(y - a.y)))) {
+                    x += sx;
+                    step_dir = sx > 0 ? om_direction::type::east : om_direction::type::west;
+                } else if (y != b.y) {
+                    y += sy;
+                    step_dir = sy > 0 ? om_direction::type::south : om_direction::type::north;
+                } else {
+                    break;
+                }
+                const point step(x, y);
+                if (is_water(step)) {
+                    st.run.push_back({.pos = step, .dir = step_dir});
+                    continue;
+                }
+                // Land after a run closes it with this cell as its exit.
+                if (!flush_run(step, a)) { st.run.clear(); }
+                st.run_entry = step;
+                claim_cell(x, y, step_dir, tier);
+                if (dual_lane) { maybe_claim_lane(step, step_dir); }
+            }
+        }
+        if (road.points.size() >= 2) {
+            flush_run((road.points.back() - base).raw(), (road.points.front() - base).raw());
+        }
+    };
+    // OSM splits real causeways into several short ways, and their shared
+    // junction cells sit in open water.  The rasterizer is driven through
+    // those seams: a way ending in water stores its deferred run keyed by the
+    // junction cell, and any way starting at that same cell continues the
+    // crossing with it, so the seams rasterize into one span with no
+    // floating bridgeheads.  A water end no way continues (packet edge cut)
+    // keeps the run unreferenced and the span stays dropped.
+    const auto point_key = [](const point_abs_omt& p) -> std::uint64_t {
+        return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(p.x())) << 32)
+             | static_cast<std::uint32_t>(p.y());
+    };
+    std::unordered_map<std::uint64_t, std::vector<std::size_t>> ways_by_start;
+    std::unordered_map<std::uint64_t, geo_walk_state> pending_runs;
+    for (const overmap_geo& packet : overmap_geo::all()) {
+        const std::vector<geo_road>& roads = packet.roads();
+        // A way whose first vertex is land, or that no other way feeds into,
+        // starts its own crossing walk.  Every other way waits until its
+        // feeder chain reaches it: if such a way walked first, in plain
+        // packet order, it would drop its water run with no entry to carry
+        // and the crossing would lose its seam span for good.
+        std::unordered_set<std::uint64_t> watery_ends;
+        ways_by_start.clear();
+        pending_runs.clear();
+        for (std::size_t i = 0; i < roads.size(); i++) {
+            if (roads[i].points.empty()) { continue; }
+            ways_by_start[point_key(roads[i].points.front())].push_back(i);
+            if (watery_at((roads[i].points.back() - base).raw())) {
+                watery_ends.insert(point_key(roads[i].points.back()));
+            }
+        }
+        std::vector<std::uint8_t> is_root(roads.size(), 1);
+        for (std::size_t i = 0; i < roads.size(); i++) {
+            const geo_road& road = roads[i];
+            if (road.points.empty()) {
+                is_root[i] = 0;
+                continue;
+            }
+            const point front = (road.points.front() - base).raw();
+            is_root[i] = !(
+                watery_at(front) && watery_ends.count(point_key(road.points.front())) != 0);
+        }
+        std::vector<std::uint8_t> visited(roads.size(), 0);
+        std::vector<std::size_t> queue;
+        queue.reserve(64);
+        const auto visit = [&](std::size_t i) {
+            if (visited[i]) { return; }
+            queue.push_back(i);
+            while (!queue.empty()) {
+                const std::size_t j = queue.back();
+                queue.pop_back();
+                if (visited[j]) { continue; }
+                visited[j] = 1;
+                const geo_road& road = roads[j];
+                geo_walk_state st;
+                const auto inherited = pending_runs.find(point_key(road.points.front()));
+                if (inherited != pending_runs.end()) { st = inherited->second; }
+                rasterize_road(road, st);
+                if (road.points.empty() || st.run.empty()) { continue; }
+                const std::uint64_t end_key = point_key(road.points.back());
+                pending_runs[end_key] = st;
+                const auto next = ways_by_start.find(end_key);
+                if (next == ways_by_start.end()) { continue; }
+                for (const std::size_t k : next->second) {
+                    if (!visited[k]) { queue.push_back(k); }
+                }
+            }
+        };
+        for (std::size_t i = 0; i < roads.size(); i++) {
+            if (is_root[i]) { visit(i); }
+        }
+        // Leftovers: ways of broken chains (no land root behind a water
+        // junction) walk fresh and keep the drop-at-water semantics.
+        for (std::size_t i = 0; i < roads.size(); i++) {
+            if (!visited[i]) { visit(i); }
+        }
+    }
+
+    // Bridge spans get their rotated overpass terrain before the road lines
+    // are painted, so line masks can treat them as connected.
+    std::vector<point_om_omt> bridge_points;
+    for (int y = 0; y < OMAPY; y++) {
+        for (int x = 0; x < OMAPX; x++) {
+            if (is_bridge[y * OMAPX + x]) {
+                bridge_points.emplace_back(x, y);
+                ter_set(tripoint_om_omt(x, y, 0),
+                        bridge_type->get_rotated(bridge_dir[y * OMAPX + x]));
+            }
+        }
+    }
+    // Plain road cells painted from the connectivity bitmask; off-overmap
+    // neighbors count as connected to keep roads visually continuous across
+    // overmap boundaries.
+    auto road_connected =
+        [&is_road, &is_bridge](const int x, const int y, const int dx, const int dy) -> bool {
+        const int nx = x + dx;
+        const int ny = y + dy;
+        if (nx < 0 || nx >= OMAPX || ny < 0 || ny >= OMAPY) { return true; }
+        const std::size_t nidx = ny * OMAPX + nx;
+        return is_road[nidx] || is_bridge[nidx];
+    };
+    for (int y = 0; y < OMAPY; y++) {
+        for (int x = 0; x < OMAPX; x++) {
+            const std::size_t idx = y * OMAPX + x;
+            if (is_bridge[idx] || !is_road[idx]) { continue; }
+            auto line = std::size_t{0};
+            if (road_connected(x, y, 0, -1)) {
+                line = om_lines::set_segment(line, om_direction::type::north);
+            }
+            if (road_connected(x, y, 1, 0)) {
+                line = om_lines::set_segment(line, om_direction::type::east);
+            }
+            if (road_connected(x, y, 0, 1)) {
+                line = om_lines::set_segment(line, om_direction::type::south);
+            }
+            if (road_connected(x, y, -1, 0)) {
+                line = om_lines::set_segment(line, om_direction::type::west);
+            }
+            ter_set(tripoint_om_omt(x, y, 0), road_type->get_linear(line));
+        }
+    }
+    // Elevate accumulated bridge spans into overpasses, mirroring how the
+    // vanilla local road connection does it.  BN has no bridge center oters.
+    if (!bridge_points.empty()) {
+        elevate_bridges(*this, bridge_points, "bridge_road", "bridge_under", "bridgehead_ground",
+                        "bridgehead_ramp", "", "road_ew", "road_ns");
+    }
+    return true;
+}
+
 void overmap::place_forests() {
     const oter_id default_oter_id(settings->default_oter);
     const oter_id forest("forest");
@@ -4260,6 +4684,16 @@ void overmap::place_swamps() {
 
 void overmap::place_roads(
     const overmap* north, const overmap* east, const overmap* south, const overmap* west) {
+    if (geo_terrain_guidance()) {
+        // Real-earth coverage: roads come from packet polylines already
+        // painted by place_geo.  Instead of the vanilla exit seeding and
+        // connection drawing, register exits where real roads cross this
+        // overmap border, letting procedural neighbors continue them with
+        // the regular connection machinery.
+        place_geo_road_exits();
+        return;
+    }
+
     const overmap_connection_id local_road("local_road");
     std::vector<tripoint_om_omt>& roads_out = connections_out[local_road];
 
@@ -4332,6 +4766,42 @@ void overmap::place_roads(
     connect_closest_points(road_points, 0, *local_road);
 }
 
+/// Registers local_road exits on border cells carrying real-earth road
+/// oters, so procedural neighbors outside the packet coverage continue the
+/// real roads with vanilla connection building.
+void overmap::place_geo_road_exits() {
+    namespace ranges = std::ranges;
+
+    const overmap_connection_id local_road("local_road");
+    std::vector<tripoint_om_omt>& roads_out = connections_out[local_road];
+
+    const auto handoff_side = [&](const std::vector<tripoint_om_omt>& border_cells) {
+        std::vector<tripoint_om_omt> found;
+        for (const tripoint_om_omt& p : border_cells) {
+            if (is_ot_match("road", ter(p), ot_match_type::type)) { found.push_back(p); }
+        }
+        std::shuffle(found.begin(), found.end(), rng_get_engine());
+        // Up to two exits per border, mirroring the vanilla seeding cap.
+        for (std::size_t i = 0; i < found.size(); i++) {
+            if (i == 2) { break; }
+            if (!ranges::contains(roads_out, found[i])) { roads_out.push_back(found[i]); }
+        }
+    };
+
+    std::vector<tripoint_om_omt> border_cells;
+    for (int i = 10; i < OMAPX - 10; i++) { border_cells.emplace_back(i, 0, 0); }
+    handoff_side(border_cells);
+    border_cells.clear();
+    for (int i = 10; i < OMAPX - 10; i++) { border_cells.emplace_back(i, OMAPY - 1, 0); }
+    handoff_side(border_cells);
+    border_cells.clear();
+    for (int i = 10; i < OMAPY - 10; i++) { border_cells.emplace_back(0, i, 0); }
+    handoff_side(border_cells);
+    border_cells.clear();
+    for (int i = 10; i < OMAPY - 10; i++) { border_cells.emplace_back(OMAPX - 1, i, 0); }
+    handoff_side(border_cells);
+}
+
 void overmap::place_river(point_om_omt pa, point_om_omt pb) {
     const oter_id river_center("river_center");
     int river_chance = static_cast<int>(std::max(1.0, 1.0 / settings->river_scale));
@@ -4399,6 +4869,7 @@ void overmap::place_river(point_om_omt pa, point_om_omt pb) {
 }
 
 void overmap::place_cities() {
+    if (place_geo_cities()) { return; }
     const city_settings& city_spec = settings->city_spec;
     int op_city_size =
         city_spec.city_size >= 0 ? city_spec.city_size : get_option<int>("CITY_SIZE");
@@ -4436,9 +4907,6 @@ void overmap::place_cities() {
     const int MAX_PLACEMENT_ATTEMTPS = OMAPX * OMAPY;
     int placement_attempts = 0;
     int finale_distance = 1;
-    std::unique_ptr<std::array<map_layer, OVERMAP_LAYERS>> layer_backup_p(
-        new std::array<map_layer, OVERMAP_LAYERS>());
-    std::array<map_layer, 21UL>& layer_backup = *layer_backup_p;
 
     // place a seed for NUM_CITIES cities, and maybe one more
     while (cities.size() < static_cast<size_t>(NUM_CITIES)
@@ -4470,50 +4938,168 @@ void overmap::place_cities() {
         // TODO: put cities closer to the edge when they can span overmaps
         // don't draw cities across the edge of the map, they will get clipped
         const tripoint_om_omt p{rng(size - 1, OMAPX - size), rng(size - 1, OMAPY - size), 0};
-        // make a backup of the map
-        layer_backup = layer;
-        tmp.finale_placed = false;
-        int finale_attempts = 0;
-        int finale_max_tries = 1500;
-        // attempt to generate a city with a finale if it's not tiny. If it's tiny just run once via
-        // a do while.
-        do {
-            // std::unordered_map<tripoint_om_omt, std::string> oter_id_migrations;
-            if (ter(p) == settings->default_oter) {
-                placement_attempts = 0;
-                ter_set(p, oter_id("road_nesw_manhole")); // every city starts with an intersection
-                ter_set(p + tripoint_below, oter_id("sewer_isolated"));
-                tmp.pos = p.xy();
-                tmp.size = size;
-                ;
-                tmp.finale_counter = rng(0, finale_distance);
-                cities.push_back(tmp);
-
-                const auto start_dir = om_direction::random();
-                auto cur_dir = start_dir;
-                std::vector<tripoint_om_omt> sewers;
-
-                do {
-                    build_city_street(local_road, tmp.pos, size, cur_dir, tmp, sewers);
-                } while ((cur_dir = om_direction::turn_right(cur_dir)) != start_dir);
-                for (const tripoint_om_omt& p : sewers) {
-                    build_connection(tmp.pos, p.xy(), p.z(), *sewer_tunnel, false);
-                }
-
-                // if the city finale failed to place, restore from last backup and try again at the
-                // top of the loop
-                if (!tmp.finale_placed && tmp.attempt_finale
-                    && finale_attempts < finale_max_tries) {
-                    layer = layer_backup;
-                }
-            }
-            finale_attempts++;
-        } while ((tmp.attempt_finale && !tmp.finale_placed && finale_attempts < finale_max_tries));
+        spawn_city_with_finale(
+            city_spawn_options{
+                .pos = p,
+                .size = size,
+                .finale_distance = finale_distance,
+                .finale_max_tries = 1500},
+            tmp, placement_attempts);
     }
+}
+
+auto overmap::spawn_city_with_finale(
+    const city_spawn_options& opts, city& tmp, int& placement_attempts) -> bool {
+    const overmap_connection_id sewer_tunnel("sewer_tunnel");
+    const overmap_connection_id local_road_id("local_road");
+    const overmap_connection& local_road(*local_road_id);
+
+    // make a backup of the map
+    std::unique_ptr<std::array<map_layer, OVERMAP_LAYERS>> layer_backup_p(
+        new std::array<map_layer, OVERMAP_LAYERS>());
+    std::array<map_layer, 21UL>& layer_backup = *layer_backup_p;
+    layer_backup = layer;
+    tmp.finale_placed = false;
+    int finale_attempts = 0;
+    bool seeded = false;
+    // attempt to generate a city with a finale if it's not tiny. If it's tiny just run once via a
+    // do while.
+    do {
+        // std::unordered_map<tripoint_om_omt, std::string> oter_id_migrations;
+        if (ter(opts.pos) == settings->default_oter) {
+            placement_attempts = 0;
+            seeded = true;
+            ter_set(opts.pos, oter_id("road_nesw_manhole")); // every city starts with an
+                                                             // intersection
+            ter_set(opts.pos + tripoint_below, oter_id("sewer_isolated"));
+            tmp.pos = opts.pos.xy();
+            tmp.size = opts.size;
+            ;
+            tmp.finale_counter = rng(0, opts.finale_distance);
+            cities.push_back(tmp);
+
+            const auto start_dir = om_direction::random();
+            auto cur_dir = start_dir;
+            std::vector<tripoint_om_omt> sewers;
+
+            do {
+                build_city_street(local_road, tmp.pos, opts.size, cur_dir, tmp, sewers);
+            } while ((cur_dir = om_direction::turn_right(cur_dir)) != start_dir);
+            for (const tripoint_om_omt& sewer : sewers) {
+                build_connection(tmp.pos, sewer.xy(), sewer.z(), *sewer_tunnel, false);
+            }
+
+            // if the city finale failed to place, restore from last backup and try again at the top
+            // of the loop
+            if (!tmp.finale_placed && tmp.attempt_finale
+                && finale_attempts < opts.finale_max_tries) {
+                layer = layer_backup;
+            }
+        }
+        finale_attempts++;
+    } while ((tmp.attempt_finale && !tmp.finale_placed && finale_attempts < opts.finale_max_tries));
+    return seeded;
+}
+
+auto overmap::geo_terrain_guidance() -> bool {
+    namespace ranges = std::ranges;
+
+    if (get_option<std::string>("GEOGRAPHY_MODE") != "real_earth") { return false; }
+    const point_abs_omt base = global_base_point();
+    const point_abs_omt omap_max = base + point(OMAPX - 1, OMAPY - 1);
+    return ranges::any_of(overmap_geo::all(), [&](const overmap_geo& packet) {
+        const geo_bounds b = packet.bounds();
+        return b.min.x() <= omap_max.x() && b.min.y() <= omap_max.y() && b.max.x() >= base.x()
+            && b.max.y() >= base.y();
+    });
+}
+
+auto overmap::geo_city_guidance() -> bool {
+    namespace ranges = std::ranges;
+
+    if (!geo_terrain_guidance()) { return false; }
+    // Geo packets own city placement wherever any of them lists cities.
+    const point_abs_omt base = global_base_point();
+    const point_abs_omt omap_max = base + point(OMAPX - 1, OMAPY - 1);
+    return ranges::any_of(overmap_geo::all(), [&](const overmap_geo& packet) {
+        const geo_bounds b = packet.bounds();
+        return !packet.cities().empty() && b.min.x() <= omap_max.x() && b.min.y() <= omap_max.y()
+            && b.max.x() >= base.x() && b.max.y() >= base.y();
+    });
+}
+
+auto overmap::place_geo_cities() -> bool {
+    namespace ranges = std::ranges;
+
+    if (!geo_city_guidance()) { return false; }
+    if (get_option<int>("CITY_SIZE") <= 0) {
+        // Cities globally disabled: geo packets do not override the option.
+        return true;
+    }
+    const point_abs_omt base = global_base_point();
+
+    int placement_attempts = 0;
+    for (const overmap_geo& packet : overmap_geo::all()) {
+        for (const geo_city& city_def : packet.cities()) {
+            const point p_local(city_def.pos.x() - base.x(), city_def.pos.y() - base.y());
+            if (p_local.x < 0 || p_local.x >= OMAPX || p_local.y < 0 || p_local.y >= OMAPY) {
+                continue;
+            }
+            place_geo_city(city_def, tripoint_om_omt(p_local.x, p_local.y, 0), placement_attempts);
+        }
+    }
+    if (cities.empty()) {
+        dbg(DL::Info) << "place_geo_cities: no real city falls in overmap (" << base.x() << ","
+                      << base.y() << ")";
+    }
+    return true;
+}
+
+auto overmap::place_geo_city(
+    const geo_city& city_def, const tripoint_om_omt& pos, int& placement_attempts) -> void {
+    // Prefer the recorded center; when it sits on non-seedable terrain
+    // (painted water), nudge to the nearest default-terrain cell so the
+    // intersection hub can be planted.
+    std::optional<tripoint_om_omt> seed = std::nullopt;
+    for (int r = 0; r <= 12 && !seed; r++) {
+        for (int dy = -r; dy <= r && !seed; dy++) {
+            for (int dx = -r; dx <= r && !seed; dx++) {
+                if (std::max(std::abs(dx), std::abs(dy)) != r) { continue; }
+                const tripoint_om_omt cand{pos.xy() + point(dx, dy), 0};
+                if (cand.x() < 0 || cand.x() >= OMAPX || cand.y() < 0 || cand.y() >= OMAPY) {
+                    continue;
+                }
+                if (ter(cand) == settings->default_oter) { seed = cand; }
+            }
+        }
+    }
+    if (!seed) {
+        dbg(DL::Info) << "place_geo_city: no seedable terrain within 12 cells of " << pos.x() << ","
+                      << pos.y();
+        return;
+    }
+
+    city tmp(seed->xy(), city_def.size);
+    tmp.name = city_def.name;
+    tmp.attempt_finale = city_def.finale && settings->city_spec.finales.finalized;
+    const int finale_distance = city_def.finale ? (city_def.size >= 16 ? 15 : 5) : 1;
+    spawn_city_with_finale(
+        city_spawn_options{
+            .pos = *seed,
+            .size = city_def.size,
+            .finale_distance = finale_distance,
+            .finale_max_tries = tmp.attempt_finale ? 1500 : 1},
+        tmp, placement_attempts);
 }
 
 auto overmap::place_isolated_cities() -> void {
     namespace ranges = std::ranges;
+
+    if (geo_city_guidance()) {
+        // Real-earth coverage: geo packets own all city placement, including
+        // isolated procedural towns.
+        return;
+    }
 
     const auto& config = settings->isolated_city;
     if (!config.enabled) { return; }
